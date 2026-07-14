@@ -48,13 +48,23 @@ final class Router
 
         // ---- Status ----
         if ($method === 'GET' && $path === '/status') {
-            $this->json($this->status->status($ctx));
+            $payload = $this->status->status($ctx);
+            // Let the UI reflect an in-progress backup (disable Start/Restart).
+            $payload['backupRunning'] = $this->backups->isRunningFor($ctx->id);
+            $this->json($payload);
             return;
         }
 
         // ---- Power ----
         if ($method === 'POST' && in_array($path, ['/start', '/stop', '/restart', '/kill'], true)) {
-            $this->power->run($ctx, ltrim($path, '/'));
+            $action = ltrim($path, '/');
+            // A backup stops the container and restores its prior state itself;
+            // starting it meanwhile would read half-written data and defeat that.
+            // Enforce it server-side, not just by disabling the button.
+            if (($action === 'start' || $action === 'restart') && $this->backups->isRunningFor($ctx->id)) {
+                throw new HttpException(409, 'a backup is currently running');
+            }
+            $this->power->run($ctx, $action);
             $this->json(['ok' => true]);
             return;
         }
@@ -77,12 +87,17 @@ final class Router
         }
 
         // ---- Backups ----
+        if ($path === '/backups/stats' && $method === 'GET') {
+            $this->json($this->backups->stats($ctx));
+            return;
+        }
         if ($path === '/backups' && $method === 'GET') {
             $this->json($this->backups->list($ctx));
             return;
         }
         if ($path === '/backups' && $method === 'POST') {
-            $this->json($this->backups->create($ctx), 201);
+            // 202: the backup is started asynchronously (see BackupService::create).
+            $this->json($this->backups->create($ctx), 202);
             return;
         }
         if (preg_match('#^/backups/([^/]+)/restore$#', $path, $m) && $method === 'POST') {

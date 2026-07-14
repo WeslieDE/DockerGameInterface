@@ -132,10 +132,19 @@ final class DockerClient
         if ($status === 200) {
             return;
         }
+        // Split an optional "name:tag" (e.g. "docker:cli"); default to :latest.
+        // A ':' that is followed by a '/' is a registry port, not a tag.
+        $name = $image;
+        $tag  = 'latest';
+        $pos  = strrpos($image, ':');
+        if ($pos !== false && strpos($image, '/', $pos) === false) {
+            $name = substr($image, 0, $pos);
+            $tag  = substr($image, $pos + 1);
+        }
         // Pull. The body is a stream of JSON progress lines we simply drain.
         [$pullStatus] = $this->request(
             'POST',
-            '/images/create?' . http_build_query(['fromImage' => $image, 'tag' => 'latest'])
+            '/images/create?' . http_build_query(['fromImage' => $name, 'tag' => $tag])
         );
         if ($pullStatus !== 200) {
             throw new DockerException("could not pull image '$image' (HTTP $pullStatus)", $pullStatus);

@@ -11,14 +11,17 @@
   Login is done exclusively via a "Server Token".
 
   Expected API endpoints (all sent with header  Authorization: Bearer <token>):
-    GET    /api/status                    -> { online, name, address, version, uptime, resources:{ram:{used,max}, cpu, cpuSample:{total,time}, disk:{used,max}} }
+    GET    /api/status                    -> { online, name, address, version, uptime, backupRunning, resources:{ram:{used,max}, cpu, cpuSample:{total,time}, disk:{used,max}} }
                                             (Ping is NOT taken from here — it is measured client-side, browser -> webserver.)
                                             (cpu is null; the CPU % is derived client-side from consecutive cpuSample counters.)
+                                            (backupRunning: true while a backup is in progress; Start/Restart are then rejected with 409.)
     POST   /api/start | /stop | /restart | /kill
+                                            (start/restart -> 409 while a backup is running)
     GET    /api/console?after=<seq>       -> { lines:[{seq,ts,text}], last:<seq> }
     POST   /api/command                   body: { command }
     GET    /api/backups                   -> [{ id, name, size, created, status }]
-    POST   /api/backups                   (create backup)  -> { id }
+    GET    /api/backups/stats             -> { disk:{free,total,used,freeH,totalH,usedH}, backups:{count,bytes,sizeH} }
+    POST   /api/backups                   (start a backup, async)  -> 202 { id, status:"started" }  (409 if one is already running)
     POST   /api/backups/<id>/restore
     GET    /api/backups/<id>/download      (file download)
     DELETE /api/backups/<id>
@@ -289,6 +292,22 @@
   .power-row { display:flex; flex-wrap:wrap; gap:12px; justify-content:center; padding: 6px 20px 20px; }
   .power-row .btn { min-width: 120px; }
 
+  /* Shown while a backup is running — Start/Restart are locked. */
+  .backup-lock {
+    display:flex; align-items:center; justify-content:center; gap:10px;
+    margin: 6px 20px 0; padding: 10px 14px;
+    background: rgba(255,138,61,.12);
+    border: 1px solid var(--orange);
+    border-radius: var(--radius-sm);
+    color: var(--orange); font-size: 13px; font-weight: 600;
+  }
+  .backup-lock .spin {
+    width: 14px; height: 14px; border-radius: 50%; flex:none;
+    border: 2px solid rgba(255,138,61,.35); border-top-color: var(--orange);
+    animation: spin .8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
   /* ---------- Charts ---------- */
   .charts { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-top: 20px; align-items: start; }
   .charts .card { margin-top: 0; }   /* neutralise generic ".card + .card" gap inside the grid */
@@ -317,6 +336,20 @@
   .backup-card .meta .row { display:flex; align-items:center; gap:6px; margin-top:4px; }
   .backup-card .bc-actions { display:flex; gap:10px; padding: 0 16px 16px; }
   .backup-card .bc-actions .btn { flex:1; padding: 9px; }
+
+  /* Disk usage on the Backups page */
+  .disk-usage { margin-bottom: 20px; }
+  .disk-meter {
+    height: 10px; border-radius: 6px; overflow: hidden;
+    background: var(--panel-2); margin-top: 6px;
+  }
+  .disk-meter > span { display:block; height:100%; background: var(--teal); border-radius: 6px; }
+  .disk-meter > span.high { background: var(--orange); }
+  .disk-meter > span.full { background: var(--red); }
+  .disk-caption {
+    display:flex; justify-content:space-between; gap:12px;
+    font-size: 12px; color: var(--text-dim); margin-top: 8px;
+  }
 
   /* ---------- Toast ---------- */
   #toasts { position: fixed; right: 20px; bottom: 20px; display:flex; flex-direction:column; gap:10px; z-index: 50; }
@@ -408,6 +441,9 @@
           <input id="cmdInput" placeholder="send command…" autocomplete="off" spellcheck="false" />
           <button class="btn btn-ghost" id="cmdSend">Send</button>
         </div>
+        <div class="backup-lock hidden" id="backupLock">
+          <span class="spin"></span> Backup in progress — Start &amp; Restart are locked
+        </div>
         <div class="power-row">
           <button class="btn btn-green"  data-action="start">▶ Start</button>
           <button class="btn btn-accent" data-action="restart">⟳ Restart</button>
@@ -440,7 +476,36 @@
         </div>
       </div>
 
-      <div class="card">
+      <div class="tiles disk-usage" id="backupStats">
+        <div class="tile">
+          <div>
+            <div class="label">Backups (this server)</div>
+            <div class="value" id="statBackups">—</div>
+          </div>
+          <div class="icon disk"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M5 3h11l3 3v15H5z"/><path d="M8 3v5h6V3M8 14h8v5H8z"/></svg></div>
+        </div>
+        <div class="tile">
+          <div>
+            <div class="label">Disk free</div>
+            <div class="value" id="statFree">—</div>
+          </div>
+          <div class="icon teal" style="background:var(--teal)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 12a8 8 0 0 1 16 0"/><path d="M12 12l4-4"/></svg></div>
+        </div>
+        <div class="tile">
+          <div>
+            <div class="label">Disk total</div>
+            <div class="value" id="statTotal">—</div>
+          </div>
+          <div class="icon" style="background:var(--panel-2)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><ellipse cx="12" cy="6" rx="8" ry="3"/><path d="M4 6v12c0 1.7 3.6 3 8 3s8-1.3 8-3V6"/><path d="M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/></svg></div>
+        </div>
+      </div>
+      <div class="disk-meter" id="diskMeter"><span></span></div>
+      <div class="disk-caption">
+        <span id="diskUsedLabel">Disk used: —</span>
+        <span id="diskPctLabel"></span>
+      </div>
+
+      <div class="card" style="margin-top:20px">
         <div class="card-head">
           <h3>Backups</h3>
           <button class="btn btn-accent" id="createBackup">＋ Create backup</button>
@@ -468,6 +533,7 @@ const App = (() => {
   let token = null;
   let consoleSeq = 0;               // last read line sequence
   let pingMs = null;                // locally measured round-trip time (browser -> webserver)
+  let backupRunning = false;        // true while a backup is in progress (locks Start/Restart)
   const timers = [];
 
   // Client-side rolling history for the charts, filled from live /api/status
@@ -651,6 +717,9 @@ const App = (() => {
     dot.className = "dot " + (s.online ? "online" : "offline");
     document.getElementById("sysStatusText").textContent = s.online ? "Online" : "Offline";
 
+    // Reflect an in-progress backup (locks Start/Restart, shows the banner).
+    applyBackupState(!!s.backupRunning);
+
     // Tiles
     const r = s.resources || {};
     // Derive the CPU % client-side from the raw counter (see cpuPercentFrom).
@@ -762,20 +831,78 @@ const App = (() => {
      POWER ACTIONS
      ===================================================================== */
   const ACTIONS = { start: "Start", stop: "Stop", restart: "Restart", kill: "Kill" };
+
+  // Lock/unlock Start & Restart (and the Create-backup button) while a backup
+  // runs, and show the banner. The server enforces the same rules (409) — this
+  // is just the visual reflection. The backup runs asynchronously, so this is
+  // driven by the /status poll (backupRunning), not by a blocking request.
+  function applyBackupState(running) {
+    const wasRunning = backupRunning;
+    backupRunning = running;
+
+    document.getElementById("backupLock").classList.toggle("hidden", !running);
+    document.querySelectorAll('[data-action="start"], [data-action="restart"]').forEach(b => {
+      b.disabled = running;
+      b.title = running ? "Locked while a backup is running" : "";
+    });
+    const createBtn = document.getElementById("createBackup");
+    createBtn.disabled = running;
+    createBtn.textContent = running ? "Creating…" : "＋ Create backup";
+
+    // Just finished (running -> idle): the archive now exists — refresh the list.
+    if (wasRunning && !running) { loadBackups(); }
+  }
+
   async function power(action) {
+    if (backupRunning && (action === "start" || action === "restart")) {
+      toast("A backup is running — please wait.", true);
+      return;
+    }
     if ((action === "stop" || action === "kill") && !confirm(`Really ${ACTIONS[action].toLowerCase()} the server?`)) return;
     try {
       await api("/" + action, { method: "POST" });
       toast(`${ACTIONS[action]} executed.`);
       appendLines([{ ts: nowTime(), text: `> ${ACTIONS[action]} requested…` }]);
       setTimeout(loadStatus, 400);
-    } catch (ex) { if (ex.message === "unreachable") forceLogout(); else toast(`${ACTIONS[action]} failed.`, true); }
+    } catch (ex) {
+      if (ex.message === "unreachable") forceLogout();
+      else if (ex.message === "HTTP 409") { toast("A backup is running — please wait.", true); loadStatus(); }
+      else toast(`${ACTIONS[action]} failed.`, true);
+    }
   }
 
   /* =====================================================================
      BACKUPS
      ===================================================================== */
+  async function loadBackupStats() {
+    let s;
+    try { s = await api("/backups/stats"); }
+    catch (ex) { if (ex.message === "unreachable") forceLogout(); return; }
+
+    const d = s.disk || {};
+    const b = s.backups || {};
+    document.getElementById("statBackups").textContent =
+      (b.sizeH || "—") + (b.count ? ` · ${b.count}` : "");
+    document.getElementById("statFree").textContent  = d.freeH  || "—";
+    document.getElementById("statTotal").textContent = d.totalH || "—";
+
+    const bar = document.querySelector("#diskMeter > span");
+    if (d.total && d.used != null) {
+      const pct = Math.min(100, Math.round((d.used / d.total) * 100));
+      bar.style.width = pct + "%";
+      bar.className = pct >= 95 ? "full" : pct >= 80 ? "high" : "";
+      document.getElementById("diskUsedLabel").textContent =
+        `Disk used: ${d.usedH} of ${d.totalH}`;
+      document.getElementById("diskPctLabel").textContent = pct + "%";
+    } else {
+      bar.style.width = "0%";
+      document.getElementById("diskUsedLabel").textContent = "Disk usage unavailable";
+      document.getElementById("diskPctLabel").textContent = "";
+    }
+  }
+
   async function loadBackups() {
+    loadBackupStats();
     let list;
     try { list = await api("/backups"); }
     catch (ex) { if (ex.message === "unreachable") forceLogout(); return; }
@@ -832,14 +959,21 @@ const App = (() => {
   }
 
   async function createBackup() {
-    const btn = document.getElementById("createBackup");
-    btn.disabled = true; btn.textContent = "Creating…";
+    if (backupRunning) return;   // guard against stacking backups
+    // The backup runs asynchronously: this POST returns as soon as the helper
+    // has started. Lock the UI immediately, then let the /status poll clear the
+    // lock and refresh the list once the helper is gone.
+    applyBackupState(true);
     try {
       await api("/backups", { method: "POST" });
-      toast("Backup is being created.");
-      loadBackups();
-    } catch (ex) { if (ex.message === "unreachable") forceLogout(); else toast("Backup failed.", true); }
-    finally { btn.disabled = false; btn.textContent = "＋ Create backup"; }
+      toast("Backup started.");
+    } catch (ex) {
+      if (ex.message === "unreachable") forceLogout();
+      else if (ex.message === "HTTP 409") toast("A backup is already running.", true);
+      else toast("Backup could not be started.", true);
+    } finally {
+      loadStatus();   // reconcile the lock state with the server
+    }
   }
 
   /* Lightweight canvas sparkline, no library */
