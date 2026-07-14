@@ -1,0 +1,19 @@
+{
+    "name": "tk-weslie/sgi",
+    "description": "Simple Game Interface — stateless Docker game-server panel",
+    "type": "project",
+    "license": "proprietary",
+    "require": {
+        "php": ">=8.3",
+        "ext-curl": "*",
+        "ext-json": "*"
+    },
+    "autoload": {
+        "psr-4": {
+            "tk\\weslie\\SGI\\": "src/"
+        }
+    },
+    "config": {
+        "optimize-autoloader": true
+    }
+}

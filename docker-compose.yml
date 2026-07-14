@@ -1,0 +1,24 @@
+services:
+  sgi:
+    build: .
+    image: tk-weslie/sgi:latest
+    container_name: sgi
+    ports:
+      - "8080:80"
+    volumes:
+      # Control the host Docker engine (read-only is enough for our calls).
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # Shared backup store, one sub-folder per token: /backup/<ServerToken>/.
+      - sgi_backup:/backup
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "sh", "-c", "curl -fsS http://localhost/ >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  sgi_backup:
+    # Central, shared backup volume — also mounted by the game containers.
+    # Create it once with:  docker volume create sgi_backup
+    external: true

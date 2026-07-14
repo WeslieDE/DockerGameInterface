@@ -1,0 +1,7 @@
+.git
+.idea
+vendor
+*.md
+!composer.json
+node_modules
+.DS_Store

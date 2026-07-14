@@ -1,0 +1,10 @@
+# Route every /api/* request through the API front-controller.
+# Static files (index.html, assets) are served directly.
+RewriteEngine On
+
+# /api and /api/... -> api/index.php (front-controller parses the rest).
+# Skip when the request already targets a real file (e.g. api/index.php itself)
+# so there is no rewrite loop.
+RewriteCond %{REQUEST_FILENAME} !-f
+RewriteCond %{REQUEST_FILENAME} !-d
+RewriteRule ^api(/.*)?$ api/index.php [L,QSA]
