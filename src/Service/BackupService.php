@@ -72,10 +72,17 @@ final class BackupService
 
     public function delete(ServerContext $ctx, string $id): void
     {
-        $path = $this->pathFor($ctx, $id);
-        if (!@unlink($path)) {
-            throw new HttpException(500, 'could not delete backup');
-        }
+        // Confirm the archive exists (throws 404) and validate the id.
+        $this->pathFor($ctx, $id);
+        $id    = $this->safeId($id);
+        $token = $this->safeToken($ctx->token);
+
+        // Files in sgi_backup are written by the root helper, so www-data
+        // (Apache) cannot unlink them directly — the token dir is root-owned.
+        // Delete through the same privileged helper, clamped to /out/<token>/.
+        $this->docker->ensureImage(self::HELPER_IMAGE);
+        $script = sprintf('rm -f /out/%s/%s', $token, $id);
+        $this->runHelper($script, null, readOnly: true);
     }
 
     /* ---------------------------------------------------------------- */
@@ -143,20 +150,24 @@ final class BackupService
     /* ---------------------------------------------------------------- */
 
     /**
-     * Run a one-shot alpine helper with the game container's volumes mounted
-     * and sgi_backup at /out. Throws on non-zero exit.
+     * Run a one-shot alpine helper with sgi_backup at /out and, when $gameId is
+     * given, the game container's volumes mounted (read-only if $readOnly).
+     * Pure /out operations (e.g. delete) pass $gameId = null. Throws on
+     * non-zero exit.
      */
-    private function runHelper(string $script, string $gameId, bool $readOnly): void
+    private function runHelper(string $script, ?string $gameId, bool $readOnly): void
     {
-        $volumesFrom = $gameId . ($readOnly ? ':ro' : '');
+        $hostConfig = [
+            'AutoRemove' => false,
+            'Binds'      => [self::BACKUP_VOLUME . ':/out'],
+        ];
+        if ($gameId !== null) {
+            $hostConfig['VolumesFrom'] = [$gameId . ($readOnly ? ':ro' : '')];
+        }
         $spec = [
             'Image'      => self::HELPER_IMAGE,
             'Cmd'        => ['sh', '-c', $script],
-            'HostConfig' => [
-                'AutoRemove'  => false,
-                'VolumesFrom' => [$volumesFrom],
-                'Binds'       => [self::BACKUP_VOLUME . ':/out'],
-            ],
+            'HostConfig' => $hostConfig,
         ];
 
         $helperId = $this->docker->createContainer($spec);
