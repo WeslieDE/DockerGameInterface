@@ -101,8 +101,9 @@ final class Router
             return;
         }
         if (preg_match('#^/backups/([^/]+)/restore$#', $path, $m) && $method === 'POST') {
-            $this->backups->restore($ctx, rawurldecode($m[1]));
-            $this->json(['ok' => true]);
+            // 202: the restore is started asynchronously and restores the
+            // container's prior state itself (see BackupService::restore).
+            $this->json($this->backups->restore($ctx, rawurldecode($m[1])), 202);
             return;
         }
         if (preg_match('#^/backups/([^/]+)/download$#', $path, $m) && $method === 'GET') {

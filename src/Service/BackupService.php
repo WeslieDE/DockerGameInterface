@@ -5,6 +5,7 @@ namespace tk\weslie\SGI\Service;
 
 use tk\weslie\SGI\Auth\ServerContext;
 use tk\weslie\SGI\Docker\DockerClient;
+use tk\weslie\SGI\Docker\RunCommandBuilder;
 use tk\weslie\SGI\Http\HttpException;
 
 /**
@@ -16,12 +17,17 @@ use tk\weslie\SGI\Http\HttpException;
  * and writes to the same sgi_backup volume. Listing, download and delete work
  * directly on /backup/<token>/, which SGI has mounted itself.
  *
- * create() additionally stops the game container before archiving and restores
- * its prior state afterwards. To keep that stop/backup/start sequence atomic
- * regardless of the PHP request lifetime, it runs entirely inside the helper:
- * a `docker:cli` image with the Docker socket bound in drives the game
- * container itself. That socket is the one deliberate break from the otherwise
- * socket-free helper isolation, and is used by create() only.
+ * create() and restore() both stop the game container before touching its data
+ * and restore its prior state afterwards (running -> restarted, stopped -> left
+ * stopped). To keep that stop/work/restore sequence atomic regardless of the PHP
+ * request lifetime, each runs entirely inside the helper: a `docker:cli` image
+ * with the Docker socket bound in drives the game container itself. That socket
+ * is the one deliberate break from the otherwise socket-free helper isolation,
+ * and is used by create()/restore() only.
+ *
+ * Both are fire-and-forget and stamp LABEL_TARGET, so isRunningFor() reports an
+ * operation in progress for either — which is what locks Start/Restart (in the
+ * UI and server-side) for the duration.
  *
  * Isolation: every filesystem op is hard-clamped to /backup/<token>/ of the
  * logged-in token; ids/names are validated to a safe basename (no traversal).
@@ -177,16 +183,42 @@ final class BackupService
         // stopped) even if PHP times out or dies mid-request.
         $id   = $this->shArg($ctx->id);
         $dest = sprintf('/out/%s/%s', $token, $file);
+
+        // SGI.Info.txt bundled into every archive: the reproduction `docker run`
+        // command at the very top, a separator, then the container's console
+        // output. The header is built here (from the inspect data SGI already
+        // holds); the log tail is captured inside the helper via `docker logs`
+        // so we do not have to marshal 500 lines through the shell.
+        $header = $this->shArg($this->infoHeader($ctx));
+
+        $q = $this->shArg($path);
+
         $lines = [
             // "true"/"false" — captured before we touch the container.
             'running=$(docker inspect -f \'{{.State.Running}}\' ' . $id . ')',
+            // Write SGI.Info.txt (run command + separator), then append last 500
+            // console lines. Done before the stop so it reflects the running
+            // state; `docker logs` still works afterwards, but this keeps it
+            // deterministic. Never let a log hiccup fail the backup.
+            'printf \'%s\' ' . $header . ' > /tmp/SGI.Info.txt',
+            'docker logs --tail 500 ' . $id . ' >> /tmp/SGI.Info.txt 2>&1 || true',
             // Ensure it is really stopped before reading; abort if stop fails
             // (the container then stays in its original running state).
             'if [ "$running" = "true" ]; then docker stop ' . $id . ' >/dev/null || exit 1; fi',
             'mkdir -p /out/' . $token,
-            // Archive the game data; keep tar's exit code for the final status.
-            'tar czf ' . $dest . ' -C ' . $this->shArg($path) . ' .',
+            // Bundle SGI.Info.txt into the archive AT THE ROOT next to the data.
+            // We cannot use a second `tar -C` for this: the helper runs BusyBox
+            // tar (alpine/docker:cli), whose option parser makes only the LAST -C
+            // win for every member — so `-C data . -C /tmp SGI.Info.txt` archived
+            // just /tmp (i.e. only the info file). BusyBox tar also lacks `-r`
+            // (append), so instead we drop the file into the (now stopped,
+            // rw-mounted) data dir, archive it in with a single -C, then remove
+            // it again. The `|| true` guards keep a data backup from ever failing
+            // over the info file.
+            'cp /tmp/SGI.Info.txt ' . $q . '/SGI.Info.txt 2>/dev/null || true',
+            'tar czf ' . $dest . ' -C ' . $q . ' .',
             'rc=$?',
+            'rm -f ' . $q . '/SGI.Info.txt 2>/dev/null || true',
             // Always restore a previously running container, even if tar failed.
             'if [ "$running" = "true" ]; then docker start ' . $id . ' >/dev/null; fi',
             'exit $rc',
@@ -199,12 +231,15 @@ final class BackupService
         // isRunningFor() (the LABEL_TARGET label); AutoRemove lets Docker discard
         // the helper once it exits, so no follow-up request is needed.
         //
-        // Read game data read-only via VolumesFrom; the socket lets the helper
-        // stop/start the game container itself.
+        // Data is mounted read-write (not the usual :ro) so the helper can drop
+        // SGI.Info.txt into the data dir, archive it in, and remove it again —
+        // see the tar note above. Safe here: the container is stopped for the
+        // duration and the file is cleaned up within the same helper run. The
+        // socket lets the helper stop/start the game container itself.
         $this->runHelper(
             implode('; ', $lines),
             $ctx->id,
-            readOnly: true,
+            readOnly: false,
             image: self::DOCKER_IMAGE,
             withDockerSocket: true,
             labels: [self::LABEL_TARGET => $ctx->id],
@@ -229,7 +264,7 @@ final class BackupService
         return $helpers !== [];
     }
 
-    public function restore(ServerContext $ctx, string $id): void
+    public function restore(ServerContext $ctx, string $id): array
     {
         $id    = $this->safeId($id);
         $path  = $this->requireBackupPath($ctx);
@@ -238,28 +273,55 @@ final class BackupService
         // Confirm the archive exists before touching the container.
         $this->pathFor($ctx, $id);
 
-        $this->docker->ensureImage(self::HELPER_IMAGE);
-
-        // Stop, wipe target dir, unpack, start again.
-        try {
-            $this->docker->stop($ctx->id);
-        } catch (\Throwable) {
-            // Already stopped is fine.
+        // One backup/restore per container at a time — do not stack helpers that
+        // would each stop/start the same container (and fight over its data).
+        if ($this->isRunningFor($ctx->id)) {
+            throw new HttpException(409, 'a backup or restore is already running');
         }
 
-        $target = $this->shArg($path);
-        $script = sprintf(
-            'set -e; rm -rf %s/* %s/.[!.]* %s/..?* 2>/dev/null || true; tar xzf /out/%s/%s -C %s',
-            $target,
-            $target,
-            $target,
-            $token,
-            $id,
-            $target
-        );
-        $this->runHelper($script, $ctx->id, readOnly: false);
+        $this->docker->ensureImage(self::DOCKER_IMAGE);
 
-        $this->docker->start($ctx->id);
+        // Like create(), the whole sequence — remember the state, stop the
+        // container, wipe + unpack the archive over the quiesced data, then
+        // restore the previous state — runs INSIDE the helper (docker CLI over
+        // the mounted socket). Once started, Docker runs it to completion, so the
+        // container is always brought back to its prior state (running ->
+        // restarted, stopped -> left stopped) even if PHP times out or dies.
+        $cid    = $this->shArg($ctx->id);
+        $target = $this->shArg($path);
+
+        $lines = [
+            // "true"/"false" — captured before we touch the container.
+            'running=$(docker inspect -f \'{{.State.Running}}\' ' . $cid . ')',
+            // Ensure it is really stopped before writing; abort if stop fails
+            // (the container then stays in its original running state, untouched).
+            'if [ "$running" = "true" ]; then docker stop ' . $cid . ' >/dev/null || exit 1; fi',
+            // Wipe the target dir, then unpack the archive into it.
+            'rm -rf ' . $target . '/* ' . $target . '/.[!.]* ' . $target . '/..?* 2>/dev/null || true',
+            'tar xzf /out/' . $token . '/' . $id . ' -C ' . $target,
+            'rc=$?',
+            // Drop the bundled SGI.Info.txt so it does not leak into the live game
+            // data (it is metadata, not state).
+            'rm -f ' . $target . '/SGI.Info.txt 2>/dev/null || true',
+            // Always restore a previously running container, even if unpack failed.
+            'if [ "$running" = "true" ]; then docker start ' . $cid . ' >/dev/null; fi',
+            'exit $rc',
+        ];
+
+        // Fire-and-forget, exactly like create(): start the helper and return.
+        // Progress is tracked purely via isRunningFor() (the LABEL_TARGET label),
+        // which locks Start/Restart until the restore finishes.
+        $this->runHelper(
+            implode('; ', $lines),
+            $ctx->id,
+            readOnly: false,
+            image: self::DOCKER_IMAGE,
+            withDockerSocket: true,
+            labels: [self::LABEL_TARGET => $ctx->id],
+            wait: false,
+        );
+
+        return ['id' => $id, 'status' => 'started'];
     }
 
     /* ---------------------------------------------------------------- */
@@ -338,6 +400,22 @@ final class BackupService
             throw new HttpException(409, 'no backup path (set sgi.backup.path or attach a named volume)');
         }
         return $path;
+    }
+
+    /**
+     * Top of the archived SGI.Info.txt: the reproduction `docker run` command,
+     * followed by a separator that heads the console log the helper appends.
+     */
+    private function infoHeader(ServerContext $ctx): string
+    {
+        $runCmd = (new RunCommandBuilder())->build($ctx->inspect);
+        $rule   = str_repeat('=', 72);
+
+        return "# docker run command to recreate this container\n"
+            . $runCmd . "\n\n"
+            . $rule . "\n"
+            . "Console output (last 500 lines)\n"
+            . $rule . "\n\n";
     }
 
     /** Token used as a folder name — restrict to a safe charset. */
