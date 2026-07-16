@@ -85,20 +85,27 @@ Then open SGI and sign in with `$TOKEN`.
 All endpoints require `Authorization: Bearer <token>` (downloads may instead
 pass `?token=<token>` because they open in a new browser tab).
 
-| Method | Path                          | Purpose                                  |
-|--------|-------------------------------|------------------------------------------|
-| GET    | `/api/status`                 | Live status (inspect + stats).           |
-| POST   | `/api/start\|stop\|restart\|kill` | Power actions.                        |
-| GET    | `/api/console?after=<seq>`    | Incremental log output.                  |
-| POST   | `/api/command`                | Write `{command}` to container stdin.    |
-| GET    | `/api/backups`                | List backups.                            |
-| POST   | `/api/backups`                | Create a backup.                         |
-| POST   | `/api/backups/<id>/restore`   | Restore a backup.                        |
-| GET    | `/api/backups/<id>/download`  | Download a backup file.                  |
-| DELETE | `/api/backups/<id>`           | Delete a backup.                         |
+| Method | Path                          | Status | Purpose                                          |
+|--------|-------------------------------|:------:|--------------------------------------------------|
+| GET    | `/api/status`                 | 200    | Live status (inspect + stats); `backupRunning` flag. |
+| POST   | `/api/start\|stop\|restart\|kill` | 200 | Power actions. `start`/`restart` return 409 while a backup runs. |
+| GET    | `/api/console?after=<seq>`    | 200    | Incremental log output.                          |
+| POST   | `/api/command`                | 200    | Write `{command}` to container stdin.            |
+| GET    | `/api/backups`                | 200    | List backups.                                    |
+| GET    | `/api/backups/stats`          | 200    | Disk free/total and this token's backup usage.   |
+| POST   | `/api/backups`                | 202    | Create a backup (runs asynchronously).           |
+| POST   | `/api/backups/upload`         | 201    | Upload a `.tar.gz` archive (multipart `file`, `save-` prefix). |
+| POST   | `/api/backups/<id>/restore`   | 202    | Restore a backup (runs asynchronously).          |
+| GET    | `/api/backups/<id>/download`  | 200    | Download a backup file.                          |
+| DELETE | `/api/backups/<id>`           | 200    | Delete a backup.                                 |
 
 `<seq>` is an opaque cursor (a log timestamp) — the server is stateless, the
 client echoes back the `last` value from the previous response.
+
+Create and restore return **202** immediately and run in a detached helper
+container; poll `/api/status` (`backupRunning`) and `/api/backups` to track
+progress. While a backup or restore is in flight, `start`/`restart` are locked
+server-side (**409**).
 
 ---
 
