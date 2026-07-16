@@ -40,6 +40,8 @@
     GET    /api/backups                   -> [{ id, name, size, created, status }]
     GET    /api/backups/stats             -> { disk:{free,total,used,freeH,totalH,usedH}, backups:{count,bytes,sizeH} }
     POST   /api/backups                   (start a backup, async)  -> 202 { id, status:"started" }  (409 if one is already running)
+    POST   /api/backups/upload            multipart/form-data field "file" (.tar.gz, max 2 GB)
+                                            -> 201 { id, name, status:"ok" }  (stored under the "save-" prefix; 413 too large, 415 wrong type)
     POST   /api/backups/<id>/restore
     GET    /api/backups/<id>/download      (file download)
     DELETE /api/backups/<id>
@@ -535,6 +537,160 @@
   .backup-card .bc-actions { display: flex; gap: 9px; padding: 0 16px 16px; }
   .backup-card .bc-actions .btn { flex: 1; padding: 9px; font-size: 15px; }
 
+  /* Card-head action cluster (Upload + Create) */
+  .head-actions { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; justify-content: flex-end; }
+  .head-actions .btn svg { flex: none; }
+
+  /* "Uploaded by user" badge on save-* archives */
+  .bc-badge {
+    margin-left: auto; flex: none;
+    font-size: 11px; font-weight: 640; letter-spacing: .01em;
+    padding: 3px 9px; border-radius: var(--r-pill);
+    color: var(--teal);
+    background: color-mix(in srgb, var(--teal) 15%, transparent);
+    border: 1px solid color-mix(in srgb, var(--teal) 34%, transparent);
+  }
+
+  /* ============================ UPLOAD MODAL ============================ */
+  .modal-overlay {
+    position: fixed; inset: 0; z-index: var(--z-toast);
+    display: grid; place-items: center;
+    padding: 20px;
+    background: color-mix(in srgb, #000 42%, transparent);
+    -webkit-backdrop-filter: blur(3px);
+    backdrop-filter: blur(3px);
+    opacity: 0;
+    transition: opacity .26s ease;
+  }
+  .modal-overlay.show { opacity: 1; }
+
+  .modal-sheet {
+    width: 100%; max-width: 460px;
+    background: var(--chrome);
+    -webkit-backdrop-filter: saturate(180%) blur(30px);
+    backdrop-filter: saturate(180%) blur(30px);
+    border: 1px solid var(--hairline);
+    border-radius: var(--r-xl);
+    box-shadow: var(--shadow-lg);
+    /* Materialize: scale up from the trigger area with a slight spring settle. */
+    transform: scale(.94) translateY(8px);
+    opacity: 0;
+    transition: transform .32s cubic-bezier(0.2, 0.9, 0.3, 1.2), opacity .24s ease;
+  }
+  .modal-overlay.show .modal-sheet { transform: none; opacity: 1; }
+
+  .modal-head {
+    display: flex; align-items: flex-start; justify-content: space-between; gap: 12px;
+    padding: 18px 18px 14px;
+    border-bottom: 1px solid var(--hairline);
+  }
+  .modal-title { display: flex; align-items: center; gap: 12px; min-width: 0; }
+  .modal-ic {
+    width: 40px; height: 40px; border-radius: 12px; flex: none;
+    display: grid; place-items: center;
+    color: var(--blue);
+    background: color-mix(in srgb, var(--blue) 14%, transparent);
+  }
+  .modal-ic svg { width: 21px; height: 21px; }
+  .modal-title h3 { margin: 0; font-size: 17px; font-weight: 680; letter-spacing: -0.02em; }
+  .modal-sub { color: var(--dim); font-size: 12.5px; margin-top: 2px; }
+
+  .modal-body { padding: 18px; display: flex; flex-direction: column; gap: 14px; }
+
+  /* Drop / pick zone */
+  .dropzone {
+    display: flex; flex-direction: column; align-items: center; gap: 8px;
+    padding: 30px 18px;
+    border: 1.5px dashed var(--hairline-2);
+    border-radius: var(--r-lg);
+    background: var(--surface-2);
+    text-align: center; cursor: pointer;
+    transition: border-color .18s ease, background-color .18s ease, transform .12s ease;
+  }
+  @media (hover: hover) { .dropzone:hover { border-color: color-mix(in srgb, var(--blue) 55%, transparent); } }
+  .dropzone:focus-visible { outline: none; box-shadow: 0 0 0 4px var(--ring); }
+  .dropzone.drag {
+    border-color: var(--blue);
+    background: color-mix(in srgb, var(--blue) 10%, transparent);
+    transform: scale(1.01);
+  }
+  .dz-ic {
+    width: 46px; height: 46px; border-radius: 14px;
+    display: grid; place-items: center;
+    color: var(--blue);
+    background: color-mix(in srgb, var(--blue) 12%, transparent);
+  }
+  .dz-ic svg { width: 24px; height: 24px; }
+  .dz-main { font-size: 14.5px; font-weight: 560; }
+  .dz-link { color: var(--blue); font-weight: 620; }
+  .dz-hint { font-size: 12px; color: var(--dim); }
+
+  /* Selected file chip */
+  .file-chip {
+    display: flex; align-items: center; gap: 12px;
+    padding: 13px 14px;
+    background: var(--surface-2);
+    border: 1px solid var(--hairline);
+    border-radius: var(--r);
+  }
+  .fc-ic {
+    width: 40px; height: 40px; border-radius: 11px; flex: none;
+    display: grid; place-items: center;
+    color: var(--teal);
+    background: color-mix(in srgb, var(--teal) 15%, transparent);
+  }
+  .fc-ic svg { width: 22px; height: 22px; }
+  .fc-meta { min-width: 0; flex: 1; }
+  .fc-name { font-weight: 600; font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .fc-size { font-size: 12.5px; color: var(--dim); margin-top: 1px; }
+
+  /* Progress */
+  .progress-wrap { display: flex; flex-direction: column; gap: 8px; }
+  .progress-top { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+  .progress-pct { font-size: 20px; font-weight: 700; letter-spacing: -0.02em; font-variant-numeric: tabular-nums; }
+  .progress-bytes { font-size: 12.5px; color: var(--dim); }
+  .progress-track {
+    height: 10px; border-radius: 6px; overflow: hidden;
+    background: var(--surface-3);
+  }
+  .progress-fill {
+    display: block; height: 100%; width: 0;
+    border-radius: 6px;
+    background: linear-gradient(90deg, var(--blue), var(--teal));
+    background-size: 200% 100%;
+    transition: width .18s linear;
+  }
+  .progress-fill.active { animation: barflow 1.1s linear infinite; }
+  @keyframes barflow { to { background-position: -200% 0; } }
+  .progress-fill.done { background: var(--green); }
+  .progress-stats {
+    display: flex; align-items: center; justify-content: space-between; gap: 12px;
+    font-size: 12.5px; color: var(--dim); font-variant-numeric: tabular-nums;
+  }
+
+  .modal-error { color: var(--red); font-size: 13px; font-weight: 550; min-height: 0; }
+  .modal-error:empty { display: none; }
+
+  .modal-foot {
+    display: flex; align-items: center; justify-content: flex-end; gap: 10px;
+    padding: 14px 18px 18px;
+    border-top: 1px solid var(--hairline);
+  }
+
+  @media (max-width: 480px) {
+    .modal-foot .btn { flex: 1; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .modal-overlay, .modal-sheet { transition: opacity .18s ease; }
+    .modal-sheet { transform: none; }
+    .progress-fill.active { animation: none; }
+    .dropzone.drag { transform: none; }
+  }
+  @media (prefers-reduced-transparency: reduce) {
+    .modal-overlay { -webkit-backdrop-filter: none; backdrop-filter: none; background: color-mix(in srgb, #000 55%, transparent); }
+    .modal-sheet { -webkit-backdrop-filter: none; backdrop-filter: none; background: var(--surface); }
+  }
+
   /* ============================ TOASTS ============================ */
   #toasts { position: fixed; right: 20px; bottom: 20px; display: flex; flex-direction: column; gap: 10px; z-index: var(--z-toast); }
   .toast {
@@ -723,7 +879,13 @@
       <div class="card" style="margin-top:20px">
         <div class="card-head">
           <h3>Backups</h3>
-          <button class="btn btn-accent" id="createBackup">＋ Create backup</button>
+          <div class="head-actions">
+            <button class="btn btn-ghost" id="uploadBackup">
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M12 16V4M7 9l5-5 5 5"/><path d="M4 16v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg>
+              Upload backup
+            </button>
+            <button class="btn btn-accent" id="createBackup">＋ Create backup</button>
+          </div>
         </div>
         <div class="card-body">
           <div class="backup-grid" id="backupGrid"></div>
@@ -732,6 +894,72 @@
     </section>
   </main>
 
+</div>
+
+<!-- ============================ UPLOAD BACKUP MODAL ============================ -->
+<div id="uploadModal" class="modal-overlay hidden" aria-hidden="true">
+  <div class="modal-sheet" role="dialog" aria-modal="true" aria-labelledby="upTitle">
+    <div class="modal-head">
+      <div class="modal-title">
+        <span class="modal-ic">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 16V4M7 9l5-5 5 5"/><path d="M4 16v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg>
+        </span>
+        <div>
+          <h3 id="upTitle">Upload backup</h3>
+          <div class="modal-sub">Add an existing <span class="mono">.tar.gz</span> archive · max 2 GB</div>
+        </div>
+      </div>
+      <button class="icon-btn" id="upClose" type="button" title="Close" aria-label="Close">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18"/></svg>
+      </button>
+    </div>
+
+    <div class="modal-body">
+      <!-- Drop / pick zone (shown until a file is chosen) -->
+      <label class="dropzone" id="dropzone" for="fileInput" tabindex="0">
+        <input id="fileInput" type="file" accept=".gz,.tgz,application/gzip,application/x-gzip" hidden />
+        <span class="dz-ic">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 15V4M8 8l4-4 4 4"/><path d="M4 15v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/></svg>
+        </span>
+        <div class="dz-main">Drop a backup here or <span class="dz-link">browse</span></div>
+        <div class="dz-hint">Only <span class="mono">.tar.gz</span> archives · up to 2 GB</div>
+      </label>
+
+      <!-- Selected file summary (shown after a file is chosen) -->
+      <div class="file-chip hidden" id="fileChip">
+        <span class="fc-ic">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"><path d="M5 3h11l3 3v15H5z"/><path d="M8 3v5h6V3M8 14h8v5H8z"/></svg>
+        </span>
+        <div class="fc-meta">
+          <div class="fc-name" id="fcName">—</div>
+          <div class="fc-size" id="fcSize">—</div>
+        </div>
+        <button class="icon-btn" id="fcClear" type="button" title="Choose another file" aria-label="Remove file">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18"/></svg>
+        </button>
+      </div>
+
+      <!-- Live progress (shown during upload) -->
+      <div class="progress-wrap hidden" id="progressWrap">
+        <div class="progress-top">
+          <span class="progress-pct" id="progPct">0%</span>
+          <span class="progress-bytes mono" id="progBytes">—</span>
+        </div>
+        <div class="progress-track"><span class="progress-fill" id="progFill"></span></div>
+        <div class="progress-stats">
+          <span id="progSpeed">— MB/s</span>
+          <span id="progEta">—</span>
+        </div>
+      </div>
+
+      <div class="modal-error" id="upError"></div>
+    </div>
+
+    <div class="modal-foot">
+      <button class="btn btn-ghost" id="upCancel" type="button">Cancel</button>
+      <button class="btn btn-accent" id="upStart" type="button" disabled>Upload</button>
+    </div>
+  </div>
 </div>
 
 <div id="toasts"></div>
@@ -909,6 +1137,8 @@ const App = (() => {
 
     // Backups
     document.getElementById("createBackup").addEventListener("click", createBackup);
+    document.getElementById("uploadBackup").addEventListener("click", openUploadModal);
+    bindUploadModal();
   }
 
   function enterApp() {
@@ -1150,11 +1380,14 @@ const App = (() => {
     catch (ex) { if (ex.message === "unreachable") forceLogout(); return; }
     const grid = document.getElementById("backupGrid");
     if (!list.length) { grid.innerHTML = `<p class="muted">No backups yet.</p>`; return; }
-    grid.innerHTML = list.map(b => `
+    grid.innerHTML = list.map(b => {
+      const uploaded = /^save-/.test(String(b.id));
+      return `
       <div class="backup-card">
         <div class="bc-head">
           <span class="ok"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M20 6 9 17l-5-5"/></svg></span>
           ${escapeHtml(b.name)}
+          ${uploaded ? `<span class="bc-badge" title="Uploaded by a user">Upload</span>` : ``}
         </div>
         <div class="bc-body">
           <div class="disk">
@@ -1172,7 +1405,8 @@ const App = (() => {
           <button class="btn btn-orange" data-bk="download" data-id="${b.id}" title="Download">⭳</button>
           <button class="btn btn-red"    data-bk="delete"   data-id="${b.id}" title="Delete">🗑</button>
         </div>
-      </div>`).join("");
+      </div>`;
+    }).join("");
 
     grid.querySelectorAll("[data-bk]").forEach(btn =>
       btn.addEventListener("click", () => backupAction(btn.dataset.bk, btn.dataset.id)));
@@ -1230,6 +1464,222 @@ const App = (() => {
     } finally {
       loadStatus();   // reconcile the lock state with the server
     }
+  }
+
+  /* =====================================================================
+     UPLOAD BACKUP  (lightbox modal + XHR upload with live progress)
+     A user-supplied .tar.gz is uploaded via XMLHttpRequest so we can render
+     a real progress bar, transfer speed and ETA from upload.onprogress —
+     fetch() gives no upload-progress events. The server stores it under the
+     "save-" prefix (see BackupService::upload).
+     ===================================================================== */
+  const MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024;   // 2 GB — mirrors the server cap
+  let selectedFile = null;
+  let uploadXhr    = null;
+  let uploading    = false;
+  // Rolling speed/ETA state (smoothed so the numbers don't jitter per event).
+  let upStartTs = 0, upLastTs = 0, upLastLoaded = 0, upEmaSpeed = 0;
+
+  function $up(id) { return document.getElementById(id); }
+
+  function bindUploadModal() {
+    const overlay = $up("uploadModal");
+    const zone    = $up("dropzone");
+    const input   = $up("fileInput");
+
+    $up("upClose").addEventListener("click", closeUploadModal);
+    $up("upCancel").addEventListener("click", () => { uploading ? cancelUpload() : closeUploadModal(); });
+    $up("upStart").addEventListener("click", startUpload);
+    $up("fcClear").addEventListener("click", () => { if (!uploading) clearUploadFile(); });
+
+    // Click on the overlay backdrop (not the sheet) closes it — unless uploading.
+    overlay.addEventListener("click", (e) => { if (e.target === overlay && !uploading) closeUploadModal(); });
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && !overlay.classList.contains("hidden") && !uploading) closeUploadModal();
+    });
+
+    input.addEventListener("change", () => { if (input.files && input.files[0]) setUploadFile(input.files[0]); });
+
+    // Drag & drop onto the zone.
+    ["dragenter", "dragover"].forEach(ev => zone.addEventListener(ev, (e) => {
+      e.preventDefault(); if (!uploading) zone.classList.add("drag");
+    }));
+    ["dragleave", "dragend"].forEach(ev => zone.addEventListener(ev, () => zone.classList.remove("drag")));
+    zone.addEventListener("drop", (e) => {
+      e.preventDefault(); zone.classList.remove("drag");
+      if (uploading) return;
+      const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+      if (f) setUploadFile(f);
+    });
+    // Keyboard-activate the (label) dropzone.
+    zone.addEventListener("keydown", (e) => {
+      if ((e.key === "Enter" || e.key === " ") && !uploading) { e.preventDefault(); input.click(); }
+    });
+    // Swallow stray file drops on the rest of the overlay so the browser
+    // doesn't navigate away to the dropped file.
+    overlay.addEventListener("dragover", (e) => e.preventDefault());
+    overlay.addEventListener("drop", (e) => e.preventDefault());
+  }
+
+  function openUploadModal() {
+    const overlay = $up("uploadModal");
+    clearUploadFile();
+    $up("upError").textContent = "";
+    overlay.classList.remove("hidden");
+    overlay.setAttribute("aria-hidden", "false");
+    // Next frame → trigger the enter transition.
+    requestAnimationFrame(() => overlay.classList.add("show"));
+  }
+
+  function closeUploadModal() {
+    if (uploading) return;
+    const overlay = $up("uploadModal");
+    overlay.classList.remove("show");
+    overlay.setAttribute("aria-hidden", "true");
+    const done = () => { overlay.classList.add("hidden"); clearUploadFile(); };
+    // Wait for the fade-out, with a fallback if transitionend doesn't fire.
+    let fired = false;
+    const once = () => { if (fired) return; fired = true; overlay.removeEventListener("transitionend", once); done(); };
+    overlay.addEventListener("transitionend", once);
+    setTimeout(once, 360);
+  }
+
+  function validateUploadFile(f) {
+    if (!/\.tar\.gz$/i.test(f.name) && !/\.tgz$/i.test(f.name)) return "Only .tar.gz backup archives can be uploaded.";
+    if (f.size <= 0) return "The selected file is empty.";
+    if (f.size > MAX_UPLOAD_BYTES) return "File too large (max 2 GB).";
+    return null;
+  }
+
+  function setUploadFile(f) {
+    const err = validateUploadFile(f);
+    if (err) { $up("upError").textContent = err; return; }
+    selectedFile = f;
+    $up("upError").textContent = "";
+    $up("fcName").textContent = f.name;
+    $up("fcSize").textContent = fmtBytes(f.size);
+    renderUploadState();
+  }
+
+  function clearUploadFile() {
+    selectedFile = null;
+    $up("fileInput").value = "";
+    $up("progFill").style.width = "0%";
+    $up("progFill").className = "progress-fill";
+    renderUploadState();
+  }
+
+  // Reflect the current step (pick → chosen → uploading) across the sheet.
+  function renderUploadState() {
+    $up("dropzone").classList.toggle("hidden", !!selectedFile);
+    $up("fileChip").classList.toggle("hidden", !selectedFile);
+    $up("progressWrap").classList.toggle("hidden", !uploading);
+    $up("fcClear").style.visibility = uploading ? "hidden" : "visible";
+    $up("upStart").disabled = !selectedFile || uploading;
+    $up("upStart").textContent = uploading ? "Uploading…" : "Upload";
+    $up("upClose").disabled = uploading;
+    $up("upCancel").textContent = uploading ? "Cancel upload" : "Cancel";
+  }
+
+  function startUpload() {
+    if (!selectedFile || uploading) return;
+    const fd = new FormData();
+    fd.append("file", selectedFile, selectedFile.name);
+
+    uploading = true;
+    upStartTs = upLastTs = performance.now();
+    upLastLoaded = 0; upEmaSpeed = 0;
+    $up("upError").textContent = "";
+    $up("progPct").textContent = "0%";
+    $up("progBytes").textContent = "0 B / " + fmtBytes(selectedFile.size);
+    $up("progSpeed").textContent = "— MB/s";
+    $up("progEta").textContent = "estimating…";
+    $up("progFill").style.width = "0%";
+    $up("progFill").className = "progress-fill active";
+    renderUploadState();
+
+    const xhr = new XMLHttpRequest();
+    uploadXhr = xhr;
+    xhr.open("POST", API + "/backups/upload");
+    xhr.setRequestHeader("Authorization", "Bearer " + token);
+    xhr.upload.addEventListener("progress", onUploadProgress);
+    xhr.addEventListener("load", () => onUploadDone(xhr));
+    xhr.addEventListener("error", () => finishUpload(false, "Network error — the upload could not be completed."));
+    xhr.addEventListener("timeout", () => finishUpload(false, "The upload timed out."));
+    xhr.send(fd);
+  }
+
+  function onUploadProgress(e) {
+    if (!e.lengthComputable) return;
+    const pct = Math.min(100, Math.round((e.loaded / e.total) * 100));
+    $up("progPct").textContent = pct + "%";
+    $up("progFill").style.width = pct + "%";
+    $up("progBytes").textContent = fmtBytes(e.loaded) + " / " + fmtBytes(e.total);
+
+    // Smoothed speed: recompute at most ~4×/s, then EMA-blend to steady it.
+    const now = performance.now();
+    const dt  = (now - upLastTs) / 1000;
+    if (dt >= 0.25) {
+      const inst = (e.loaded - upLastLoaded) / dt;                 // bytes/s
+      upEmaSpeed = upEmaSpeed ? upEmaSpeed * 0.7 + inst * 0.3 : inst;
+      upLastTs = now; upLastLoaded = e.loaded;
+      $up("progSpeed").textContent = fmtBytes(upEmaSpeed) + "/s";
+      const remaining = e.total - e.loaded;
+      const eta = upEmaSpeed > 0 ? remaining / upEmaSpeed : Infinity;
+      $up("progEta").textContent = e.loaded >= e.total ? "finishing…" : (isFinite(eta) ? fmtDuration(eta) + " left" : "—");
+    }
+  }
+
+  function onUploadDone(xhr) {
+    if (xhr.status === 201) {
+      $up("progFill").className = "progress-fill done";
+      $up("progFill").style.width = "100%";
+      $up("progPct").textContent = "100%";
+      $up("progEta").textContent = "done";
+      uploading = false; uploadXhr = null;
+      renderUploadState();
+      toast("Backup uploaded.");
+      // Let the fill flash green briefly, then close and refresh.
+      setTimeout(() => { closeUploadModal(); loadBackups(); }, 550);
+      return;
+    }
+    if (xhr.status === 401) { finishUpload(false, ""); logout(); return; }
+    let msg = "Upload failed (HTTP " + xhr.status + ").";
+    try { const d = JSON.parse(xhr.responseText); if (d && d.error) msg = d.error; } catch (e) {}
+    if (xhr.status === 413) msg = "File too large (max 2 GB).";
+    finishUpload(false, msg);
+  }
+
+  // Reset the modal to the "choose a file" state and surface an error/message.
+  function finishUpload(ok, message) {
+    uploading = false; uploadXhr = null;
+    $up("progFill").className = "progress-fill";
+    renderUploadState();
+    if (message) $up("upError").textContent = message;
+  }
+
+  function cancelUpload() {
+    if (uploadXhr) { try { uploadXhr.abort(); } catch (e) {} }
+    finishUpload(false, "");
+    $up("progFill").style.width = "0%";
+    toast("Upload cancelled.", true);
+  }
+
+  function fmtBytes(n) {
+    if (!isFinite(n) || n < 0) return "—";
+    const u = ["B", "KB", "MB", "GB", "TB"];
+    let i = 0; let v = n;
+    while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+    return (i === 0 ? v : v.toFixed(1)) + " " + u[i];
+  }
+
+  function fmtDuration(s) {
+    s = Math.max(0, Math.round(s));
+    if (s < 60) return s + "s";
+    const m = Math.floor(s / 60), sec = s % 60;
+    if (m < 60) return m + "m " + String(sec).padStart(2, "0") + "s";
+    const h = Math.floor(m / 60);
+    return h + "h " + String(m % 60).padStart(2, "0") + "m";
   }
 
   /* Lightweight canvas sparkline, no library */

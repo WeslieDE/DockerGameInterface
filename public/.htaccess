@@ -1,3 +1,16 @@
+# Backup uploads (POST /api/backups/upload) can be up to 2 GB. Raise the PHP
+# limits accordingly — the image is php:8.3-apache (mod_php), which reads these
+# php_value directives from .htaccess (AllowOverride All is set in the Dockerfile).
+# Left unguarded on purpose: an <IfModule> whose token doesn't match the PHP-8
+# module would silently drop these and fall back to the 2 MB default. A little
+# headroom above 2 GB covers the multipart envelope; the app enforces the exact
+# 2 GB cap itself. Large uploads also need generous input/execution time.
+php_value upload_max_filesize 2048M
+php_value post_max_size       2100M
+php_value max_input_time      1800
+php_value max_execution_time  1800
+php_value memory_limit        256M
+
 # Route every /api/* request through the API front-controller.
 # Static files (index.html, assets) are served directly.
 RewriteEngine On

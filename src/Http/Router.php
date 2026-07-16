@@ -100,6 +100,12 @@ final class Router
             $this->json($this->backups->create($ctx), 202);
             return;
         }
+        if ($path === '/backups/upload' && $method === 'POST') {
+            // Multipart upload of a user-supplied archive; stored synchronously
+            // under the "save-" prefix (see BackupService::upload). 201 Created.
+            $this->json($this->backups->upload($ctx, $_FILES['file'] ?? null), 201);
+            return;
+        }
         if (preg_match('#^/backups/([^/]+)/restore$#', $path, $m) && $method === 'POST') {
             // 202: the restore is started asynchronously and restores the
             // container's prior state itself (see BackupService::restore).

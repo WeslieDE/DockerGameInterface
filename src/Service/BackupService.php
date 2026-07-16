@@ -41,6 +41,18 @@ final class BackupService
     private const MOUNT_ROOT    = '/backup';
     private const BACKUP_VOLUME = 'sgi_backup';
 
+    // User-uploaded archives use the "save-" prefix (system-created ones use
+    // "backup-"), so the origin of every archive is visible from its name alone.
+    private const SAVE_PREFIX   = 'save';
+    // Hidden staging dir inside the shared volume. www-data (Apache) cannot write
+    // into the root-owned token dirs, so an uploaded file is first dropped here
+    // (this dir is chown'd to www-data once by a root helper) and then moved into
+    // /backup/<token>/ by a root helper — see upload().
+    private const STAGING_DIR   = '.staging';
+    // Hard cap for uploaded backups (2 GB). The PHP ini limits in public/.htaccess
+    // must be at least this large or the upload is rejected before it reaches us.
+    private const MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024;
+
     // Label stamped on the create() helper so a running backup can be detected
     // from Docker itself — authoritative and self-cleaning: the helper vanishes
     // when the backup ends, even if the triggering PHP request already died.
@@ -250,6 +262,90 @@ final class BackupService
     }
 
     /**
+     * Store a user-uploaded backup archive in this token's backup dir, under the
+     * normal filename schema but with the "save-" prefix (save-YYYYmmdd-His.tar.gz)
+     * so it is recognisable as a user upload rather than a system backup.
+     *
+     * The token dir is root-owned (see delete()), so www-data cannot write there
+     * directly. The upload is therefore staged in a www-data-owned dir inside the
+     * shared volume, then moved into place by a privileged root helper — the same
+     * indirection delete() uses. Unlike create()/restore() this touches no game
+     * data or container, so it is synchronous and never blocks Start/Restart.
+     *
+     * @param array<string,mixed>|null $file one entry from $_FILES
+     * @return array{id:string,name:string,status:string}
+     */
+    public function upload(ServerContext $ctx, ?array $file): array
+    {
+        if ($file === null || !isset($file['error'])) {
+            throw new HttpException(400, 'no file uploaded');
+        }
+
+        $err = (int) $file['error'];
+        if ($err !== UPLOAD_ERR_OK) {
+            $tooBig = ($err === UPLOAD_ERR_INI_SIZE || $err === UPLOAD_ERR_FORM_SIZE);
+            throw new HttpException($tooBig ? 413 : 400, $this->uploadErrorMessage($err));
+        }
+
+        $tmp  = (string) ($file['tmp_name'] ?? '');
+        $size = (int) ($file['size'] ?? 0);
+        $orig = (string) ($file['name'] ?? '');
+
+        if ($tmp === '' || !is_uploaded_file($tmp)) {
+            throw new HttpException(400, 'invalid upload');
+        }
+        if ($size <= 0) {
+            throw new HttpException(400, 'the uploaded file is empty');
+        }
+        if ($size > self::MAX_UPLOAD_BYTES) {
+            throw new HttpException(413, 'file too large (max ' . $this->humanSize(self::MAX_UPLOAD_BYTES) . ')');
+        }
+        // Must be a .tar.gz/.tgz by name AND a real gzip stream by content — the
+        // same archive shape create() produces, so restore() unpacks it unchanged.
+        // (It is always re-stored as save-*.tar.gz regardless of the source name.)
+        if (!preg_match('/\.(tar\.gz|tgz)$/i', $orig)) {
+            throw new HttpException(415, 'only .tar.gz backup archives can be uploaded');
+        }
+        if (!$this->isGzip($tmp)) {
+            throw new HttpException(415, 'file is not a valid gzip (.tar.gz) archive');
+        }
+
+        $token    = $this->safeToken($ctx->token);
+        $fileName = $this->uniqueSaveName($ctx);
+
+        // Stage into the www-data-writable dir, then hand off to a root helper.
+        $staging   = $this->ensureStaging();
+        $stageFile = $staging . '/' . bin2hex(random_bytes(8)) . '.part';
+        if (!move_uploaded_file($tmp, $stageFile)) {
+            throw new HttpException(500, 'could not stage the uploaded file');
+        }
+
+        $this->docker->ensureImage(self::HELPER_IMAGE);
+        // token / fileName / stage name are all validated to a safe charset above,
+        // so they are shell-safe here (mirrors delete()'s unquoted /out/<token>).
+        $script = sprintf(
+            'mkdir -p /out/%1$s && mv /out/%2$s/%3$s /out/%1$s/%4$s'
+            . ' && chown 0:0 /out/%1$s/%4$s && chmod 644 /out/%1$s/%4$s',
+            $token,
+            self::STAGING_DIR,
+            basename($stageFile),
+            $fileName,
+        );
+        try {
+            $this->runHelper($script, null, readOnly: true);
+        } catch (\Throwable $e) {
+            @unlink($stageFile);   // helper never took ownership — clean up
+            throw $e;
+        }
+
+        return [
+            'id'     => $fileName,
+            'name'   => (string) preg_replace('/\.tar\.gz$/', '', $fileName),
+            'status' => 'ok',
+        ];
+    }
+
+    /**
      * True while a create() backup for this game container is still in progress,
      * i.e. its labelled helper container is still running. Read straight from
      * Docker so it stays correct across separate HTTP requests and even if the
@@ -391,6 +487,87 @@ final class BackupService
     private function tokenDir(ServerContext $ctx): string
     {
         return self::MOUNT_ROOT . '/' . $this->safeToken($ctx->token);
+    }
+
+    /**
+     * Make sure the hidden staging dir exists and is writable by www-data, then
+     * return its absolute path. www-data cannot create anything under the
+     * root-owned volume root itself, so on the first call a root helper creates
+     * the dir and hands it to www-data (chown to this process' uid, mode 700).
+     * Subsequent uploads find it writable and skip the helper.
+     */
+    private function ensureStaging(): string
+    {
+        $dir = self::MOUNT_ROOT . '/' . self::STAGING_DIR;
+        clearstatcache();
+        if (is_dir($dir) && is_writable($dir)) {
+            return $dir;
+        }
+
+        // uid of the Apache worker running this code (www-data). Never trust
+        // getmyuid() here — the source files are root-owned, so it would report
+        // root; posix_geteuid() reports the actual process user.
+        $uid = function_exists('posix_geteuid') ? posix_geteuid() : 33;
+        if ($uid <= 0) {
+            $uid = 33;   // www-data in the official php:apache image
+        }
+
+        $this->docker->ensureImage(self::HELPER_IMAGE);
+        $script = sprintf(
+            'mkdir -p /out/%1$s && chown %2$d:%2$d /out/%1$s && chmod 700 /out/%1$s',
+            self::STAGING_DIR,
+            $uid,
+        );
+        $this->runHelper($script, null, readOnly: true);
+
+        clearstatcache();
+        if (!is_dir($dir) || !is_writable($dir)) {
+            throw new HttpException(500, 'could not prepare the upload staging area');
+        }
+        return $dir;
+    }
+
+    /**
+     * A "save-<timestamp>.tar.gz" name that does not yet exist in the token dir.
+     * The dir is world-readable (755) even though www-data cannot write it, so
+     * the existence check works without a helper. A "-N" suffix disambiguates
+     * the rare case of two uploads within the same second.
+     */
+    private function uniqueSaveName(ServerContext $ctx): string
+    {
+        $dir  = $this->tokenDir($ctx);
+        $base = self::SAVE_PREFIX . '-' . date('Ymd-His');
+        $name = $base . '.tar.gz';
+        for ($n = 1; is_file($dir . '/' . $name); $n++) {
+            $name = $base . '-' . $n . '.tar.gz';
+        }
+        return $name;
+    }
+
+    /** True if the file begins with the gzip magic bytes (1f 8b). */
+    private function isGzip(string $path): bool
+    {
+        $fh = @fopen($path, 'rb');
+        if ($fh === false) {
+            return false;
+        }
+        $magic = fread($fh, 2);
+        fclose($fh);
+        return $magic === "\x1f\x8b";
+    }
+
+    /** Human-readable message for a PHP $_FILES upload error code. */
+    private function uploadErrorMessage(int $code): string
+    {
+        return match ($code) {
+            UPLOAD_ERR_INI_SIZE, UPLOAD_ERR_FORM_SIZE => 'the uploaded file is too large',
+            UPLOAD_ERR_PARTIAL   => 'the upload was interrupted',
+            UPLOAD_ERR_NO_FILE   => 'no file was uploaded',
+            UPLOAD_ERR_NO_TMP_DIR => 'server has no temp dir for uploads',
+            UPLOAD_ERR_CANT_WRITE => 'server could not write the uploaded file',
+            UPLOAD_ERR_EXTENSION => 'the upload was blocked by a PHP extension',
+            default              => 'upload failed',
+        };
     }
 
     private function requireBackupPath(ServerContext $ctx): string
