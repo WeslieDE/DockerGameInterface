@@ -8,6 +8,10 @@ See [KONZEPT.md](KONZEPT.md) for the full design and [TODO.md](TODO.md) for stat
 
 ## Screenshots
 
+**Login** — sign in with the server token:
+
+![Login](doku/Login.png)
+
 **Server Console** — live log output, command input, power controls and RAM/CPU sparklines:
 
 ![Server Console](doku/Console.png)
